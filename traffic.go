@@ -76,6 +76,9 @@ func InitTraffic(filePath string, logger *zap.Logger) {
 }
 
 func (s *trafficState) restoreFromFile() {
+	if s.data == nil {
+		s.data = make(map[string]*userStats)
+	}
 	if s.file == "" {
 		return
 	}
@@ -109,6 +112,9 @@ func addTraffic(user string, rx, tx uint64) {
 	s.mu.RUnlock()
 	if u == nil {
 		s.mu.Lock()
+		if s.data == nil {
+			s.data = make(map[string]*userStats)
+		}
 		u = s.data[user]
 		if u == nil {
 			u = &userStats{}
@@ -134,6 +140,9 @@ func incConn(user string) {
 	s.mu.RUnlock()
 	if u == nil {
 		s.mu.Lock()
+		if s.data == nil {
+			s.data = make(map[string]*userStats)
+		}
 		u = s.data[user]
 		if u == nil {
 			u = &userStats{}
@@ -192,38 +201,46 @@ func (s *trafficState) periodicFlush(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.mu.Lock()
-			s.pruneStaleLocked()
-			users := make(map[string]userStatsJSON, len(s.data))
-			for k, v := range s.data {
-				users[k] = v.snapshot()
-			}
-			s.mu.Unlock()
-
-			snap := TrafficSnapshot{
-				Users:     users,
-				UpdatedAt: time.Now().Unix(),
-			}
-			data, err := json.Marshal(snap)
-			if err != nil {
-				if s.log != nil {
-					s.log.Warn("traffic marshal error", zap.Error(err))
-				}
-				continue
-			}
-			tmp := s.file + ".tmp"
-			if err := os.WriteFile(tmp, data, 0600); err != nil {
-				if s.log != nil {
-					s.log.Warn("traffic write error", zap.Error(err))
-				}
-				continue
-			}
-			if err := os.Rename(tmp, s.file); err != nil {
-				if s.log != nil {
-					s.log.Warn("traffic rename error", zap.Error(err))
-				}
-				os.Remove(tmp)
-			}
+			snap := s.collectSnapshot()
+			s.writeSnapshot(snap)
 		}
+	}
+}
+
+func (s *trafficState) collectSnapshot() TrafficSnapshot {
+	s.mu.Lock()
+	s.pruneStaleLocked()
+	users := make(map[string]userStatsJSON, len(s.data))
+	for k, v := range s.data {
+		users[k] = v.snapshot()
+	}
+	s.mu.Unlock()
+
+	return TrafficSnapshot{
+		Users:     users,
+		UpdatedAt: time.Now().Unix(),
+	}
+}
+
+func (s *trafficState) writeSnapshot(snap TrafficSnapshot) {
+	data, err := json.Marshal(snap)
+	if err != nil {
+		if s.log != nil {
+			s.log.Warn("traffic marshal error", zap.Error(err))
+		}
+		return
+	}
+	tmp := s.file + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		if s.log != nil {
+			s.log.Warn("traffic write error", zap.Error(err))
+		}
+		return
+	}
+	if err := os.Rename(tmp, s.file); err != nil {
+		if s.log != nil {
+			s.log.Warn("traffic rename error", zap.Error(err))
+		}
+		os.Remove(tmp)
 	}
 }

@@ -19,6 +19,8 @@ package httpclient
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -36,8 +38,10 @@ type HTTPConnectDialer struct {
 	ProxyURL      url.URL
 	DefaultHeader http.Header
 
-	// TODO: If spkiFp is set, use it as SPKI fingerprint to confirm identity of the
-	// proxy, instead of relying on standard PKI CA roots
+	// SpkiFP is the expected SHA-256 hash of the upstream proxy's DER-encoded
+	// SubjectPublicKeyInfo. When set, the proxy's certificate is verified against
+	// this fingerprint instead of relying solely on standard PKI CA roots.
+	// This provides certificate pinning for the upstream TLS connection.
 	SpkiFP []byte
 
 	Dialer net.Dialer // overridden dialer allow to control establishment of TCP connection
@@ -84,7 +88,6 @@ func NewHTTPConnectDialer(proxyURLStr string) (*HTTPConnectDialer, error) {
 	client := &HTTPConnectDialer{
 		ProxyURL:          *proxyURL,
 		DefaultHeader:     make(http.Header),
-		SpkiFP:            nil,
 		EnableH2ConnReuse: true,
 	}
 
@@ -222,6 +225,24 @@ func (c *HTTPConnectDialer) DialContext(ctx context.Context, network, address st
 		}
 	default:
 		return nil, errors.New("scheme " + c.ProxyURL.Scheme + " is not supported")
+	}
+
+	if len(c.SpkiFP) > 0 {
+		tlsConn, ok := rawConn.(*tls.Conn)
+		if !ok {
+			rawConn.Close()
+			return nil, errors.New("SPKI fingerprint verification requires a TLS connection")
+		}
+		certs := tlsConn.ConnectionState().PeerCertificates
+		if len(certs) == 0 {
+			rawConn.Close()
+			return nil, errors.New("SPKI fingerprint verification failed: no peer certificates")
+		}
+		spkiHash := sha256.Sum256(certs[0].RawSubjectPublicKeyInfo)
+		if subtle.ConstantTimeCompare(spkiHash[:], c.SpkiFP) != 1 {
+			rawConn.Close()
+			return nil, errors.New("SPKI fingerprint mismatch: upstream proxy identity not confirmed")
+		}
 	}
 
 	switch negotiatedProtocol {

@@ -33,7 +33,7 @@ func TestExtractUsername(t *testing.T) {
 		h.AuthCredentials = [][]byte{[]byte("dGVzdDpwYXNz")}
 		r, _ := http.NewRequest("GET", "/", nil)
 		repl := caddy.NewReplacer()
-		repl.Set("http.auth.user.id", "testuser")
+		repl.Set(replacerFieldUserID, "testuser")
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
 		r = r.WithContext(ctx)
@@ -48,7 +48,7 @@ func TestExtractUsername(t *testing.T) {
 		h.AuthCredentials = [][]byte{[]byte("dGVzdDpwYXNz")}
 		r, _ := http.NewRequest("GET", "/", nil)
 		repl := caddy.NewReplacer()
-		repl.Set("http.auth.user.id", "invalid:attacker")
+		repl.Set(replacerFieldUserID, "invalid:attacker")
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
 		r = r.WithContext(ctx)
@@ -63,7 +63,7 @@ func TestExtractUsername(t *testing.T) {
 		h.AuthCredentials = [][]byte{[]byte("dGVzdDpwYXNz")}
 		r, _ := http.NewRequest("GET", "/", nil)
 		repl := caddy.NewReplacer()
-		repl.Set("http.auth.user.id", strings.Repeat("x", 300))
+		repl.Set(replacerFieldUserID, strings.Repeat("x", 300))
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
 		r = r.WithContext(ctx)
@@ -250,8 +250,8 @@ func TestRemoveHopByHop(t *testing.T) {
 		if h.Get("Keep-Alive") != "" {
 			t.Error("Keep-Alive should be removed")
 		}
-		if h.Get("Proxy-Authorization") != "" {
-			t.Error("Proxy-Authorization should be removed")
+		if h.Get(headerProxyAuthorization) != "" {
+			t.Error(headerProxyAuthorization + " should be removed")
 		}
 		if h.Get("Content-Type") != "text/html" {
 			t.Error("Content-Type should be preserved")
@@ -328,7 +328,7 @@ func TestServeHiddenPage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !contains(w.Body.String(), "successfully authenticated") {
+		if !strings.Contains(w.Body.String(), "successfully authenticated") {
 			t.Error("should show success message")
 		}
 	})
@@ -339,8 +339,8 @@ func TestServeHiddenPage(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error for auth failure")
 		}
-		if w.Header().Get("Proxy-Authenticate") == "" {
-			t.Error("should set Proxy-Authenticate header")
+		if w.Header().Get(headerProxyAuthenticate) == "" {
+			t.Error("should set " + headerProxyAuthenticate + " header")
 		}
 		if w.Code != http.StatusProxyAuthRequired {
 			t.Errorf("expected 407, got %d", w.Code)
@@ -393,15 +393,3 @@ func TestHostIsAllowed(t *testing.T) {
 	})
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}

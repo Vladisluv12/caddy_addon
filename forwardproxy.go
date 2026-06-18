@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
@@ -44,6 +45,12 @@ import (
 	"github.com/caddyserver/forwardproxy/httpclient"
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
+)
+
+const (
+	headerProxyAuthenticate  = "Proxy-Authenticate"
+	headerProxyAuthorization = "Proxy-Authorization"
+	replacerFieldUserID      = "http.auth.user.id"
 )
 
 func init() {
@@ -106,10 +113,17 @@ type Handler struct {
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
 	upstream    *url.URL // address of upstream proxy
 
-	aclRules []aclRule
+	aclRules []aclMatcher
 
-	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
+	// AuthCredentials stores base64-encoded "username:password" pairs for Basic auth.
+	// Note: Caddy v2 has built-in authentication modules (http.authentication.providers.http_basic)
+	// but using them here would require adapting the module to Caddy's authenticator interface.
+	// The current hand-rolled approach is simpler but duplicates functionality.
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
+
+	// authHashes maps username → SHA-256 hash of decoded "username:password"
+	// Pre-computed during Provision to resist timing attacks during credential comparison.
+	authHashes map[string][32]byte `json:"-"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -143,6 +157,25 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		trafficFilePath = "/etc/rixxx-panel/naive_users.json"
 	}
 	InitTraffic(trafficFilePath, h.logger)
+
+	h.authHashes = make(map[string][32]byte)
+	for _, cred := range h.AuthCredentials {
+		decoded := make([]byte, base64.StdEncoding.DecodedLen(len(cred)))
+		n, err := base64.StdEncoding.Decode(decoded, cred)
+		if err != nil {
+			return fmt.Errorf("failed to decode auth credential: %w", err)
+		}
+		decoded = decoded[:n]
+		i := strings.IndexByte(string(decoded), ':')
+		if i < 0 {
+			return fmt.Errorf("auth credential has invalid format (missing colon separator)")
+		}
+		username := string(decoded[:i])
+		if _, exists := h.authHashes[username]; exists {
+			return fmt.Errorf("duplicate username in auth credentials: %s", username)
+		}
+		h.authHashes[username] = sha256.Sum256(decoded)
+	}
 
 	h.httpTransport = &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
@@ -239,8 +272,12 @@ func (h *Handler) initUpstreamDialer(dialer *net.Dialer) error {
 		d.Dialer = *dialer
 		if isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme == "https" {
 			h.logger.Info("Localhost upstream detected, disabling verification of TLS certificate")
+			h.logger.Warn("TLS certificate verification is disabled for localhost upstream; this is safe only in trusted development environments")
 			d.DialTLS = func(network string, address string) (net.Conn, string, error) {
-				conn, err := tls.Dial(network, address, &tls.Config{InsecureSkipVerify: true}) // #nosec G402
+				conn, err := tls.Dial(network, address, &tls.Config{
+					InsecureSkipVerify: true, // #nosec G402 — intentionally disabled for localhost self-signed certs
+					MinVersion:         tls.VersionTLS12,
+				})
 				if err != nil {
 					return nil, "", err
 				}
@@ -268,35 +305,13 @@ func (h *Handler) initUpstreamDialer(dialer *net.Dialer) error {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// start by splitting the request host and port
 	reqHost, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
-		reqHost = r.Host // OK; probably just didn't have a port
+		reqHost = r.Host
 	}
 
-	var authErr error
-	if h.AuthCredentials != nil {
-		authErr = h.checkCredentials(r)
-	}
-	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
-		return serveHiddenPage(w, authErr)
-	}
-	if h.Hosts.Match(r) && (r.Method != http.MethodConnect || authErr != nil) {
-		// Always pass non-CONNECT requests to hostname
-		// Pass CONNECT requests only if probe resistance is enabled and not authenticated
-		if h.shouldServePACFile(r) {
-			return h.servePacFile(w, r)
-		}
-		return next.ServeHTTP(w, r)
-	}
-	if authErr != nil {
-		if h.ProbeResistance != nil {
-			// probe resistance is requested and requested URI does not match secret domain;
-			// act like this proxy handler doesn't even exist (pass thru to next handler)
-			return next.ServeHTTP(w, r)
-		}
-		w.Header().Set("Proxy-Authenticate", "Basic realm=\"Caddy Secure Web Proxy\"")
-		return caddyhttp.Error(http.StatusProxyAuthRequired, authErr)
+	if err := h.handleAuthAndRouting(w, r, next, reqHost); err != nil {
+		return err
 	}
 
 	if r.ProtoMajor != 1 && r.ProtoMajor != 2 && r.ProtoMajor != 3 {
@@ -324,6 +339,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return h.handleNonConnect(w, r, ctx, username)
 }
 
+// handleAuthAndRouting performs authentication, probe resistance, and PAC file checks.
+// Returns nil if the request should continue to be proxied.
+func (h *Handler) handleAuthAndRouting(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, reqHost string) error {
+	var authErr error
+	if h.AuthCredentials != nil {
+		authErr = h.checkCredentials(r)
+	}
+
+	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
+		return serveHiddenPage(w, authErr)
+	}
+
+	if h.Hosts.Match(r) && (r.Method != http.MethodConnect || authErr != nil) {
+		if h.shouldServePACFile(r) {
+			return h.servePacFile(w, r)
+		}
+		return next.ServeHTTP(w, r)
+	}
+
+	if authErr != nil {
+		if h.ProbeResistance != nil {
+			return next.ServeHTTP(w, r)
+		}
+		w.Header().Set(headerProxyAuthenticate, "Basic realm=\"Caddy Secure Web Proxy\"")
+		return caddyhttp.Error(http.StatusProxyAuthRequired, authErr)
+	}
+	return nil
+}
+
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, ctx context.Context, username string) error {
 	if r.ProtoMajor == 2 || r.ProtoMajor == 3 {
 		if len(r.URL.Scheme) > 0 || len(r.URL.Path) > 0 {
@@ -332,9 +376,25 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, ctx cont
 		}
 	}
 
-	// HTTP CONNECT Fast Open: Directly responds with a 200 OK
-	// before attempting to connect to origin to reduce response latency.
-	// We merely close the connection if Open fails.
+	hostPort := r.URL.Host
+	if hostPort == "" {
+		hostPort = r.Host
+	}
+
+	switch r.ProtoMajor {
+	case 1:
+		return h.handleConnectH1(w, r, ctx, hostPort, username)
+	case 2:
+		fallthrough
+	case 3:
+		return h.handleConnectH2H3(w, r, ctx, hostPort, username)
+	}
+
+	panic("There was a check for http version, yet it's incorrect")
+}
+
+func (h *Handler) handleConnectH1(w http.ResponseWriter, r *http.Request, ctx context.Context, hostPort, username string) error {
+	// Set padding header before writing response
 	paddingLen := rand.Intn(32) + 30
 	padding := make([]byte, paddingLen)
 	bits := rand.Uint64()
@@ -348,23 +408,36 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, ctx cont
 	w.Header().Set("Padding", string(padding))
 
 	w.WriteHeader(http.StatusOK)
-	err := http.NewResponseController(w).Flush()
-	if err != nil {
+	if err := http.NewResponseController(w).Flush(); err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
 			fmt.Errorf("ResponseWriter flush error: %v", err))
 	}
 
-	hostPort := r.URL.Host
-	if hostPort == "" {
-		hostPort = r.Host
+	// Hijack immediately after writing 200 OK — before the client
+	// sends further tunnel data, to prevent Go's HTTP server from
+	// consuming the subsequent bytes.
+	clientConn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("hijack failed: %v", err))
 	}
+	defer clientConn.Close()
+
+	_ = clientConn.SetDeadline(time.Time{})
+
+	if n := brw.Reader.Buffered(); n > 0 {
+		rbuf, _ := brw.Peek(n)
+		_, _ = clientConn.Write(rbuf) // not needed, but harmless
+		_ = rbuf
+	}
+
 	targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
 	if err != nil {
 		return err
 	}
 	if targetConn == nil {
 		return caddyhttp.Error(http.StatusForbidden,
-			fmt.Errorf("hostname %s is not allowed", r.URL.Hostname()))
+			fmt.Errorf("hostname %s is not allowed", hostPort))
 	}
 	defer targetConn.Close()
 
@@ -373,20 +446,63 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, ctx cont
 		defer decConn(username)
 	}
 
-	switch r.ProtoMajor {
-	case 1:
-		return serveHijack(w, targetConn, username)
-	case 2:
-		fallthrough
-	case 3:
-		defer r.Body.Close()
-		return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "", username)
+	return dualStream(targetConn, clientConn, clientConn, false, username)
+}
+
+func (h *Handler) handleConnectH2H3(w http.ResponseWriter, r *http.Request, ctx context.Context, hostPort, username string) error {
+	paddingLen := rand.Intn(32) + 30
+	padding := make([]byte, paddingLen)
+	bits := rand.Uint64()
+	for i := 0; i < 16; i++ {
+		padding[i] = "!#$()+<>?@[]^`{}"[bits&15]
+		bits >>= 4
+	}
+	for i := 16; i < paddingLen; i++ {
+		padding[i] = '~'
+	}
+	w.Header().Set("Padding", string(padding))
+
+	w.WriteHeader(http.StatusOK)
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("ResponseWriter flush error: %v", err))
 	}
 
-	panic("There was a check for http version, yet it's incorrect")
+	targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
+	if err != nil {
+		return err
+	}
+	if targetConn == nil {
+		return caddyhttp.Error(http.StatusForbidden,
+			fmt.Errorf("hostname %s is not allowed", hostPort))
+	}
+	defer targetConn.Close()
+
+	if username != "" {
+		incConn(username)
+		defer decConn(username)
+	}
+
+	defer r.Body.Close()
+	return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "", username)
 }
 
 func (h *Handler) handleNonConnect(w http.ResponseWriter, r *http.Request, ctx context.Context, username string) error {
+	h.prepareNonConnectRequest(r)
+
+	response, err := h.doRoundTrip(r, ctx, username)
+	if err != nil {
+		return err
+	}
+
+	if username != "" && response != nil && response.Body != nil {
+		response.Body = &countingReadCloser{rc: response.Body, username: username, isRx: true}
+	}
+
+	return forwardResponse(w, response)
+}
+
+func (h *Handler) prepareNonConnectRequest(r *http.Request) {
 	if r.URL.Scheme == "" {
 		r.URL.Scheme = "http"
 	}
@@ -406,52 +522,46 @@ func (h *Handler) handleNonConnect(w http.ResponseWriter, r *http.Request, ctx c
 	if !h.HideVia {
 		r.Header.Add("Via", strconv.Itoa(r.ProtoMajor)+"."+strconv.Itoa(r.ProtoMinor)+" caddy")
 	}
+}
 
-	var response *http.Response
-	var err error
-	if h.upstream == nil {
-		if r.Body != nil &&
-			(r.Method == "GET" || r.Method == "HEAD" || r.Method == "OPTIONS" || r.Method == "TRACE") {
-			rBodyBuf, err := io.ReadAll(r.Body)
-			if err != nil {
-				return caddyhttp.Error(http.StatusBadRequest,
-					fmt.Errorf("failed to read request body: %v", err))
-			}
-			if username != "" && len(rBodyBuf) > 0 {
-				addTraffic(username, 0, uint64(len(rBodyBuf)))
-			}
-			r.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(rBodyBuf)), nil
-			}
-			r.Body, _ = r.GetBody()
-		}
-		response, err = h.httpTransport.RoundTrip(r)
-	} else {
-		response, err = h.roundTripUpstream(r, ctx)
+func (h *Handler) doRoundTrip(r *http.Request, ctx context.Context, username string) (*http.Response, error) {
+	if h.upstream != nil {
+		return h.roundTripUpstream(r, ctx)
 	}
+
+	if r.Body != nil && (r.Method == "GET" || r.Method == "HEAD" || r.Method == "OPTIONS" || r.Method == "TRACE") {
+		rBodyBuf, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, caddyhttp.Error(http.StatusBadRequest,
+				fmt.Errorf("failed to read request body: %v", err))
+		}
+		if username != "" && len(rBodyBuf) > 0 {
+			addTraffic(username, 0, uint64(len(rBodyBuf)))
+		}
+		r.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(rBodyBuf)), nil
+		}
+		r.Body, _ = r.GetBody()
+	}
+
+	response, err := h.httpTransport.RoundTrip(r)
 	if err := r.Body.Close(); err != nil {
-		return caddyhttp.Error(http.StatusBadGateway,
+		return nil, caddyhttp.Error(http.StatusBadGateway,
 			fmt.Errorf("failed to close response body: %v", err))
 	}
-
 	if err != nil {
 		if _, ok := err.(caddyhttp.HandlerError); ok {
-			return err
+			return nil, err
 		}
-		return caddyhttp.Error(http.StatusBadGateway,
+		return nil, caddyhttp.Error(http.StatusBadGateway,
 			fmt.Errorf("failed to read response: %v", err))
 	}
-
-	if username != "" && response != nil && response.Body != nil {
-		response.Body = &countingReadCloser{rc: response.Body, username: username, isRx: true}
-	}
-
-	return forwardResponse(w, response)
+	return response, nil
 }
 
 func (h *Handler) roundTripUpstream(r *http.Request, ctx context.Context) (*http.Response, error) {
 	if creds := h.upstream.User.String(); creds != "" {
-		r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+		r.Header.Set(headerProxyAuthorization, "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
 	}
 	if r.URL.Port() == "" {
 		r.URL.Host = net.JoinHostPort(r.URL.Host, "80")
@@ -474,44 +584,56 @@ func (h *Handler) roundTripUpstream(r *http.Request, ctx context.Context) (*http
 }
 
 func (h Handler) checkCredentials(r *http.Request) error {
-	pa := strings.Split(r.Header.Get("Proxy-Authorization"), " ")
+	pa := strings.Split(r.Header.Get(headerProxyAuthorization), " ")
 	if len(pa) != 2 {
-		return errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>")
+		return errors.New(headerProxyAuthorization + " is required! Expected format: <type> <credentials>")
 	}
 	if strings.ToLower(pa[0]) != "basic" {
 		return errors.New("auth type is not supported")
 	}
-	for _, creds := range h.AuthCredentials {
-		if subtle.ConstantTimeCompare(creds, []byte(pa[1])) == 1 {
-			repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-			buf := make([]byte, base64.StdEncoding.DecodedLen(len(creds)))
-			_, _ = base64.StdEncoding.Decode(buf, creds) // should not err ever since we are decoding a known good input
-			cred := string(buf)
-			repl.Set("http.auth.user.id", cred[:strings.IndexByte(cred, ':')])
-			// Please do not consider this to be timing-attack-safe code. Simple equality is almost
-			// mindlessly substituted with constant time algo and there ARE known issues with this code,
-			// e.g. size of smallest credentials is guessable. TODO: protect from all the attacks! Hash?
-			return nil
-		}
-	}
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	buf := make([]byte, base64.StdEncoding.DecodedLen(len([]byte(pa[1]))))
-	n, err := base64.StdEncoding.Decode(buf, []byte(pa[1]))
+
+	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(pa[1])))
+	n, err := base64.StdEncoding.Decode(decoded, []byte(pa[1]))
 	if err != nil {
-		repl.Set("http.auth.user.id", "invalidbase64:"+err.Error())
+		repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+		repl.Set(replacerFieldUserID, "invalidbase64:"+err.Error())
 		return err
 	}
-	if utf8.Valid(buf[:n]) {
-		cred := string(buf[:n])
-		i := strings.IndexByte(cred, ':')
-		if i >= 0 {
-			repl.Set("http.auth.user.id", "invalid:"+cred[:i])
-		} else {
-			repl.Set("http.auth.user.id", "invalidformat:"+cred)
-		}
-	} else {
-		repl.Set("http.auth.user.id", "invalid::")
+	decoded = decoded[:n]
+
+	if !utf8.Valid(decoded) {
+		repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+		repl.Set(replacerFieldUserID, "invalid::")
+		return errors.New("invalid credentials")
 	}
+
+	credStr := string(decoded)
+	i := strings.IndexByte(credStr, ':')
+	if i < 0 {
+		repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+		repl.Set(replacerFieldUserID, "invalidformat:"+credStr)
+		return errors.New("invalid credentials")
+	}
+	username := credStr[:i]
+
+	incomingHash := sha256.Sum256(decoded)
+	expectedHash, exists := h.authHashes[username]
+
+	var match bool
+	if exists {
+		match = subtle.ConstantTimeCompare(incomingHash[:], expectedHash[:]) == 1
+	} else {
+		var zeroHash [32]byte
+		subtle.ConstantTimeCompare(incomingHash[:], zeroHash[:])
+		match = false
+	}
+
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	if match {
+		repl.Set(replacerFieldUserID, username)
+		return nil
+	}
+	repl.Set(replacerFieldUserID, "invalid:"+username)
 	return errors.New("invalid credentials")
 }
 
@@ -523,7 +645,7 @@ func (h Handler) extractUsername(r *http.Request) string {
 	if !ok {
 		return ""
 	}
-	val, ok := repl.Get("http.auth.user.id")
+	val, ok := repl.Get(replacerFieldUserID)
 	if !ok {
 		return ""
 	}
@@ -552,65 +674,62 @@ func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
 
 // dialContextCheckACL enforces Access Control List and calls fp.DialContext
 func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string) (net.Conn, error) {
-	var conn net.Conn
-
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
-		// return nil, &proxyError{S: "Network " + network + " is not supported", Code: http.StatusBadRequest}
 		return nil, caddyhttp.Error(http.StatusBadRequest,
 			fmt.Errorf("network %s is not supported", network))
 	}
 
 	host, port, err := net.SplitHostPort(hostPort)
 	if err != nil {
-		// return nil, &proxyError{S: err.Error(), Code: http.StatusBadRequest}
 		return nil, caddyhttp.Error(http.StatusBadRequest, err)
 	}
 
 	if h.upstream != nil {
-		// if upstreaming -- do not resolve locally nor check acl
-		conn, err = h.dialContext(ctx, network, hostPort)
+		conn, err := h.dialContext(ctx, network, hostPort)
 		if err != nil {
-			// return conn, &proxyError{S: err.Error(), Code: http.StatusBadGateway}
 			return conn, caddyhttp.Error(http.StatusBadGateway, err)
 		}
 		return conn, nil
 	}
 
 	if !h.portIsAllowed(port) {
-		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
 		return nil, caddyhttp.Error(http.StatusForbidden,
 			fmt.Errorf("port %s is not allowed", port))
 	}
 
-match:
+	if !h.domainIsAllowed(host) {
+		return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("disallowed host %s", host))
+	}
+
+	return h.dialAllowedIP(ctx, network, host, port)
+}
+
+func (h Handler) domainIsAllowed(host string) bool {
 	for _, rule := range h.aclRules {
 		if _, ok := rule.(*aclDomainRule); ok {
 			switch rule.tryMatch(nil, host) {
 			case aclDecisionDeny:
-				return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("disallowed host %s", host))
+				return false
 			case aclDecisionAllow:
-				break match
+				return true
 			}
 		}
 	}
+	return true // not denied by domain rules, let IP rules decide
+}
 
-	// in case IP was provided, net.LookupIP will simply return it
+func (h Handler) dialAllowedIP(ctx context.Context, network, host, port string) (net.Conn, error) {
 	IPs, err := net.LookupIP(host)
 	if err != nil {
-		// return nil, &proxyError{S: fmt.Sprintf("Lookup of %s failed: %v", host, err),
-		// Code: http.StatusBadGateway}
 		return nil, caddyhttp.Error(http.StatusBadGateway,
 			fmt.Errorf("lookup of %s failed: %v", host, err))
 	}
 
-	// This is net.Dial's default behavior: if the host resolves to multiple IP addresses,
-	// Dial will try each IP address in order until one succeeds
 	for _, ip := range IPs {
 		if !h.hostIsAllowed(host, ip) {
 			continue
 		}
-
-		conn, err = h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		conn, err := h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 		if err == nil {
 			return conn, nil
 		}
@@ -628,8 +747,7 @@ func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
 			return true
 		}
 	}
-	// TODO: convert this to log entry
-	// fmt.Println("ERROR: no acl match for ", hostname, ip) // shouldn't happen
+		h.logger.Warn("no acl match", zap.String("hostname", hostname), zap.Stringer("ip", ip))
 	return false
 }
 
@@ -669,7 +787,7 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 
 	w.Header().Set("Content-Type", "text/html")
 	if authErr != nil {
-		w.Header().Set("Proxy-Authenticate", "Basic realm=\"Caddy Secure Web Proxy\"")
+		w.Header().Set(headerProxyAuthenticate, "Basic realm=\"Caddy Secure Web Proxy\"")
 		w.WriteHeader(http.StatusProxyAuthRequired)
 		_, _ = w.Write([]byte(fmt.Sprintf(hiddenPage, AuthFail)))
 		return authErr
@@ -681,23 +799,21 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
 func serveHijack(w http.ResponseWriter, targetConn net.Conn, username string) error {
-	w.WriteHeader(http.StatusOK)
 	clientConn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
 			fmt.Errorf("hijack failed: %v", err))
 	}
 	defer clientConn.Close()
-	// bufReader may contain unprocessed buffered data from the client.
-	// snippet borrowed from `proxy` plugin
+
+	if err := clientConn.SetDeadline(time.Time{}); err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("failed to clear connection deadlines: %v", err))
+	}
+
 	if n := brw.Reader.Buffered(); n > 0 {
 		rbuf, _ := brw.Peek(n)
 		_, _ = targetConn.Write(rbuf)
-	}
-	err = brw.Flush()
-	if err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError,
-			fmt.Errorf("failed to flush to client: %v", err))
 	}
 
 	return dualStream(targetConn, clientConn, clientConn, false, username)
@@ -715,7 +831,6 @@ const (
 // Caddy should finish writing target -> clientReader.
 func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool, username string) error {
 	stream := func(w io.Writer, r io.Reader, paddingType int, isRx bool) error {
-		// copy bytes from r to w
 		bufPtr := bufferPool.Get().(*[]byte)
 		buf := *bufPtr
 		buf = buf[0:cap(buf)]
@@ -735,28 +850,28 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		}
 		return _err
 	}
-	if padding {
-		go func() {
-			if err := stream(target, clientReader, RemovePadding, false); err != nil {
-				globalTraffic.mu.RLock()
-				if globalTraffic.log != nil {
-					globalTraffic.log.Debug("tx stream error", zap.Error(err))
-				}
-				globalTraffic.mu.RUnlock()
-			}
-		}()
-		return stream(clientWriter, target, AddPadding, true)
-	}
-	go func() {
-		if err := stream(target, clientReader, NoPadding, false); err != nil {
+
+	goStream := func(dst io.Writer, src io.Reader, padType int, isRx bool) {
+		if err := stream(dst, src, padType, isRx); err != nil {
 			globalTraffic.mu.RLock()
 			if globalTraffic.log != nil {
-				globalTraffic.log.Debug("tx stream error", zap.Error(err))
+				globalTraffic.log.Warn("tx stream error", zap.Error(err))
 			}
 			globalTraffic.mu.RUnlock()
+			if c, ok := dst.(net.Conn); ok {
+				_ = c.Close()
+			}
 		}
-	}()
-	return stream(clientWriter, target, NoPadding, true)
+	}
+
+	txPadType := NoPadding
+	rxPadType := NoPadding
+	if padding {
+		txPadType = RemovePadding
+		rxPadType = AddPadding
+	}
+	go goStream(target, clientReader, txPadType, false)
+	return stream(clientWriter, target, rxPadType, true)
 }
 
 type countingReadCloser struct {
@@ -785,46 +900,66 @@ type closeWriter interface {
 	CloseWrite() error
 }
 
+func readWithAddPadding(src io.Reader, buf []byte) (int, error) {
+	paddingSize := rand.Intn(256)
+	maxRead := len(buf) - 3 - paddingSize
+	if maxRead < 1 {
+		maxRead = 1
+	}
+	nr, er := src.Read(buf[3 : 3+maxRead])
+	if nr > 0 {
+		buf[0] = byte(nr / 256)
+		buf[1] = byte(nr % 256)
+		buf[2] = byte(paddingSize)
+		for i := 0; i < paddingSize; i++ {
+			buf[3+nr+i] = 0
+		}
+		nr += 3 + paddingSize
+	}
+	return nr, er
+}
+
+func readWithRemovePadding(src io.Reader, buf []byte) (int, error) {
+	nr, er := io.ReadFull(src, buf[0:3])
+	if nr < 3 {
+		return nr, er
+	}
+	dataLen := int(buf[0])*256 + int(buf[1])
+	paddingSize := int(buf[2])
+	if dataLen > len(buf) {
+		dataLen = len(buf)
+	}
+	nr, er = io.ReadFull(src, buf[0:dataLen])
+	if nr > 0 {
+		var junk [256]byte
+		if paddingSize > 256 {
+			paddingSize = 256
+		}
+		_, _ = io.ReadFull(src, junk[0:paddingSize])
+	}
+	return nr, er
+}
+
 // flushingIoCopy is analogous to buffering io.Copy(), but also attempts to flush on each iteration.
 // If dst does not implement http.Flusher(e.g. net.TCPConn), it will do a simple io.CopyBuffer().
 // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
 func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (written int64, err error) {
-	rw, ok := dst.(http.ResponseWriter)
 	var rc *http.ResponseController
-	if ok {
+	if rw, ok := dst.(http.ResponseWriter); ok {
 		rc = http.NewResponseController(rw)
 	}
 	var numPadding int
 	for {
 		var nr int
 		var er error
-		if paddingType == AddPadding && numPadding < NumFirstPaddings {
+		switch {
+		case paddingType == AddPadding && numPadding < NumFirstPaddings:
 			numPadding++
-			paddingSize := rand.Intn(256)
-			maxRead := 65536 - 3 - paddingSize
-			nr, er = src.Read(buf[3:maxRead])
-			if nr > 0 {
-				buf[0] = byte(nr / 256)
-				buf[1] = byte(nr % 256)
-				buf[2] = byte(paddingSize)
-				for i := 0; i < paddingSize; i++ {
-					buf[3+nr+i] = 0
-				}
-				nr += 3 + paddingSize
-			}
-		} else if paddingType == RemovePadding && numPadding < NumFirstPaddings {
+			nr, er = readWithAddPadding(src, buf)
+		case paddingType == RemovePadding && numPadding < NumFirstPaddings:
 			numPadding++
-			nr, er = io.ReadFull(src, buf[0:3])
-			if nr > 0 {
-				nr = int(buf[0])*256 + int(buf[1])
-				paddingSize := int(buf[2])
-				nr, er = io.ReadFull(src, buf[0:nr])
-				if nr > 0 {
-					var junk [256]byte
-					_, er = io.ReadFull(src, junk[0:paddingSize])
-				}
-			}
-		} else {
+			nr, er = readWithRemovePadding(src, buf)
+		default:
 			nr, er = src.Read(buf)
 		}
 		if nr > 0 {
@@ -837,8 +972,7 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 				break
 			}
 			if rc != nil {
-				ef := rc.Flush()
-				if ef != nil {
+				if ef := rc.Flush(); ef != nil {
 					err = ef
 					break
 				}
@@ -890,8 +1024,8 @@ func removeHopByHop(header http.Header) {
 
 var hopByHopHeaders = []string{
 	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
+	headerProxyAuthenticate,
+	headerProxyAuthorization,
 	"Upgrade",
 	"Connection",
 	"Proxy-Connection",

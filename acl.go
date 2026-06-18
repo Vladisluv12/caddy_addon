@@ -20,7 +20,7 @@ const (
 	aclDecisionNoMatch
 )
 
-type aclRule interface {
+type aclMatcher interface {
 	tryMatch(ip net.IP, domain string) aclDecision
 }
 
@@ -69,7 +69,7 @@ func (a *aclAllRule) tryMatch(ip net.IP, domain string) aclDecision {
 	return aclDecisionDeny
 }
 
-func newACLRule(ruleSubject string, allow bool) (aclRule, error) {
+func newACLRule(ruleSubject string, allow bool) (aclMatcher, error) {
 	if ruleSubject == "all" {
 		return &aclAllRule{allow: allow}, nil
 	}
