@@ -108,9 +108,7 @@ func (c *HTTPConnectDialer) Dial(network, address string) (net.Conn, error) {
 // Users of context.WithValue should define their own types for keys
 type ContextKeyHeader struct{}
 
-// ctx.Value will be inspected for optional ContextKeyHeader{} key, with `http.Header` value,
-// which will be added to outgoing request headers, overriding any colliding c.DefaultHeader
-func (c *HTTPConnectDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (c *HTTPConnectDialer) buildRequest(ctx context.Context, address string) *http.Request {
 	req := (&http.Request{
 		Method: "CONNECT",
 		URL:    &url.URL{Host: address},
@@ -120,147 +118,99 @@ func (c *HTTPConnectDialer) DialContext(ctx context.Context, network, address st
 	for k, v := range c.DefaultHeader {
 		req.Header[k] = v
 	}
-	if ctxHeader, ctxHasHeader := ctx.Value(ContextKeyHeader{}).(http.Header); ctxHasHeader {
+	if ctxHeader, ok := ctx.Value(ContextKeyHeader{}).(http.Header); ok {
 		for k, v := range ctxHeader {
 			req.Header[k] = v
 		}
 	}
+	return req
+}
 
-	connectHttp2 := func(rawConn net.Conn, h2clientConn *http2.ClientConn) (net.Conn, error) {
-		req.Proto = "HTTP/2.0"
-		req.ProtoMajor = 2
-		req.ProtoMinor = 0
-		pr, pw := io.Pipe()
-		req.Body = pr
-
-		resp, err := h2clientConn.RoundTrip(req)
-		if err != nil {
-			err = rawConn.Close()
-			return nil, err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			_ = rawConn.Close()
-			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status)
-		}
-		return NewHttp2Conn(rawConn, pw, resp.Body), nil
+func (c *HTTPConnectDialer) tryReuseH2Conn(req *http.Request) (net.Conn, bool) {
+	if !c.EnableH2ConnReuse {
+		return nil, false
 	}
-
-	connectHttp1 := func(rawConn net.Conn) (net.Conn, error) {
-		req.Proto = "HTTP/1.1"
-		req.ProtoMajor = 1
-		req.ProtoMinor = 1
-
-		err := req.Write(rawConn)
-		if err != nil {
-			err = rawConn.Close()
-			return nil, err
-		}
-
-		resp, err := http.ReadResponse(bufio.NewReader(rawConn), req)
-		if err != nil {
-			err = rawConn.Close()
-			return nil, err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			_ = rawConn.Close()
-			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status)
-		}
-		return rawConn, nil
+	c.cacheH2Mu.Lock()
+	if c.cachedH2ClientConn == nil || c.cachedH2RawConn == nil || !c.cachedH2ClientConn.CanTakeNewRequest() {
+		c.cacheH2Mu.Unlock()
+		return nil, false
 	}
+	rc := c.cachedH2RawConn
+	cc := c.cachedH2ClientConn
+	c.cacheH2Mu.Unlock()
 
-	if c.EnableH2ConnReuse {
-		c.cacheH2Mu.Lock()
-		unlocked := false
-		if c.cachedH2ClientConn != nil && c.cachedH2RawConn != nil {
-			if c.cachedH2ClientConn.CanTakeNewRequest() {
-				rc := c.cachedH2RawConn
-				cc := c.cachedH2ClientConn
-				c.cacheH2Mu.Unlock()
-				unlocked = true
-				proxyConn, err := connectHttp2(rc, cc)
-				if err == nil {
-					return proxyConn, err
-				}
-				// else: carry on and try again
-			}
-		}
-		if !unlocked {
-			c.cacheH2Mu.Unlock()
-		}
+	proxyConn, err := c.connectHttp2(req, rc, cc)
+	if err != nil {
+		return nil, false
 	}
+	return proxyConn, true
+}
 
-	var err error
-	var rawConn net.Conn
-	negotiatedProtocol := ""
+func (c *HTTPConnectDialer) dialToProxy(ctx context.Context, network string) (net.Conn, string, error) {
 	switch c.ProxyURL.Scheme {
 	case "http":
-		rawConn, err = c.Dialer.DialContext(ctx, network, c.ProxyURL.Host)
-		if err != nil {
-			return nil, err
-		}
+		rawConn, err := c.Dialer.DialContext(ctx, network, c.ProxyURL.Host)
+		return rawConn, "", err
 	case "https":
 		if c.DialTLS != nil {
-			rawConn, negotiatedProtocol, err = c.DialTLS(network, c.ProxyURL.Host)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			tlsConf := tls.Config{
-				NextProtos: []string{"h2", "http/1.1"},
-				ServerName: c.ProxyURL.Hostname(),
-				MinVersion: tls.VersionTLS12,
-			}
-			tlsConn, err := tls.Dial(network, c.ProxyURL.Host, &tlsConf)
-			if err != nil {
-				return nil, err
-			}
-			err = tlsConn.Handshake()
-			if err != nil {
-				return nil, err
-			}
-			negotiatedProtocol = tlsConn.ConnectionState().NegotiatedProtocol
-			rawConn = tlsConn
+			return c.DialTLS(network, c.ProxyURL.Host)
 		}
+		tlsConf := tls.Config{
+			NextProtos: []string{"h2", "http/1.1"},
+			ServerName: c.ProxyURL.Hostname(),
+			MinVersion: tls.VersionTLS12,
+		}
+		tlsConn, err := tls.Dial(network, c.ProxyURL.Host, &tlsConf)
+		if err != nil {
+			return nil, "", err
+		}
+		if err = tlsConn.Handshake(); err != nil {
+			return nil, "", err
+		}
+		return tlsConn, tlsConn.ConnectionState().NegotiatedProtocol, nil
 	default:
-		return nil, errors.New("scheme " + c.ProxyURL.Scheme + " is not supported")
+		return nil, "", errors.New("scheme " + c.ProxyURL.Scheme + " is not supported")
 	}
+}
 
-	if len(c.SpkiFP) > 0 {
-		tlsConn, ok := rawConn.(*tls.Conn)
-		if !ok {
-			rawConn.Close()
-			return nil, errors.New("SPKI fingerprint verification requires a TLS connection")
-		}
-		certs := tlsConn.ConnectionState().PeerCertificates
-		if len(certs) == 0 {
-			rawConn.Close()
-			return nil, errors.New("SPKI fingerprint verification failed: no peer certificates")
-		}
-		spkiHash := sha256.Sum256(certs[0].RawSubjectPublicKeyInfo)
-		if subtle.ConstantTimeCompare(spkiHash[:], c.SpkiFP) != 1 {
-			rawConn.Close()
-			return nil, errors.New("SPKI fingerprint mismatch: upstream proxy identity not confirmed")
-		}
+func (c *HTTPConnectDialer) verifySPKI(rawConn net.Conn) error {
+	if len(c.SpkiFP) == 0 {
+		return nil
 	}
+	tlsConn, ok := rawConn.(*tls.Conn)
+	if !ok {
+		rawConn.Close()
+		return errors.New("SPKI fingerprint verification requires a TLS connection")
+	}
+	certs := tlsConn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		rawConn.Close()
+		return errors.New("SPKI fingerprint verification failed: no peer certificates")
+	}
+	spkiHash := sha256.Sum256(certs[0].RawSubjectPublicKeyInfo)
+	if subtle.ConstantTimeCompare(spkiHash[:], c.SpkiFP) != 1 {
+		rawConn.Close()
+		return errors.New("SPKI fingerprint mismatch: upstream proxy identity not confirmed")
+	}
+	return nil
+}
 
+func (c *HTTPConnectDialer) negotiateCONNECT(req *http.Request, rawConn net.Conn, negotiatedProtocol string) (net.Conn, error) {
 	switch negotiatedProtocol {
 	case "":
 		fallthrough
 	case "http/1.1":
-		return connectHttp1(rawConn)
+		return c.connectHttp1(req, rawConn)
 	case "h2":
 		t := http2.Transport{}
 		h2clientConn, err := t.NewClientConn(rawConn)
 		if err != nil {
-			err = rawConn.Close()
+			rawConn.Close()
 			return nil, err
 		}
-
-		proxyConn, err := connectHttp2(rawConn, h2clientConn)
+		proxyConn, err := c.connectHttp2(req, rawConn, h2clientConn)
 		if err != nil {
-			err = rawConn.Close()
+			rawConn.Close()
 			return nil, err
 		}
 		if c.EnableH2ConnReuse {
@@ -269,12 +219,72 @@ func (c *HTTPConnectDialer) DialContext(ctx context.Context, network, address st
 			c.cachedH2RawConn = rawConn
 			c.cacheH2Mu.Unlock()
 		}
-		return proxyConn, err
+		return proxyConn, nil
 	default:
-		_ = rawConn.Close()
-		return nil, errors.New("negotiated unsupported application layer protocol: " +
-			negotiatedProtocol)
+		rawConn.Close()
+		return nil, errors.New("negotiated unsupported application layer protocol: " + negotiatedProtocol)
 	}
+}
+
+func (c *HTTPConnectDialer) connectHttp2(req *http.Request, rawConn net.Conn, h2clientConn *http2.ClientConn) (net.Conn, error) {
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	pr, pw := io.Pipe()
+	req.Body = pr
+
+	resp, err := h2clientConn.RoundTrip(req)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		rawConn.Close()
+		return nil, errors.New("Proxy responded with non 200 code: " + resp.Status)
+	}
+	return NewHttp2Conn(rawConn, pw, resp.Body), nil
+}
+
+func (c *HTTPConnectDialer) connectHttp1(req *http.Request, rawConn net.Conn) (net.Conn, error) {
+	req.Proto = "HTTP/1.1"
+	req.ProtoMajor = 1
+	req.ProtoMinor = 1
+
+	if err := req.Write(rawConn); err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(rawConn), req)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		rawConn.Close()
+		return nil, errors.New("Proxy responded with non 200 code: " + resp.Status)
+	}
+	return rawConn, nil
+}
+
+// ctx.Value will be inspected for optional ContextKeyHeader{} key, with `http.Header` value,
+// which will be added to outgoing request headers, overriding any colliding c.DefaultHeader
+func (c *HTTPConnectDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	req := c.buildRequest(ctx, address)
+
+	if proxyConn, ok := c.tryReuseH2Conn(req); ok {
+		return proxyConn, nil
+	}
+
+	rawConn, negotiatedProtocol, err := c.dialToProxy(ctx, network)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.verifySPKI(rawConn); err != nil {
+		return nil, err
+	}
+
+	return c.negotiateCONNECT(req, rawConn, negotiatedProtocol)
 }
 
 func NewHttp2Conn(c net.Conn, pipedReqBody *io.PipeWriter, respBody io.ReadCloser) net.Conn {
