@@ -310,8 +310,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		reqHost = r.Host
 	}
 
-	if err := h.handleAuthAndRouting(w, r, next, reqHost); err != nil {
+	handled, err := h.handleAuthAndRouting(w, r, next, reqHost)
+	if err != nil {
 		return err
+	}
+	if handled {
+		return nil
 	}
 
 	if r.ProtoMajor != 1 && r.ProtoMajor != 2 && r.ProtoMajor != 3 {
@@ -340,32 +344,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 }
 
 // handleAuthAndRouting performs authentication, probe resistance, and PAC file checks.
-// Returns nil if the request should continue to be proxied.
-func (h *Handler) handleAuthAndRouting(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, reqHost string) error {
+// Returns (true, nil) if the request was fully handled by this function.
+// Returns (true, error) if the request was handled and an error occurred.
+// Returns (false, nil) if the request should continue to be proxied.
+func (h *Handler) handleAuthAndRouting(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, reqHost string) (bool, error) {
 	var authErr error
 	if h.AuthCredentials != nil {
 		authErr = h.checkCredentials(r)
 	}
 
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
-		return serveHiddenPage(w, authErr)
+		return true, serveHiddenPage(w, authErr)
 	}
 
 	if h.Hosts.Match(r) && (r.Method != http.MethodConnect || authErr != nil) {
 		if h.shouldServePACFile(r) {
-			return h.servePacFile(w, r)
+			return true, h.servePacFile(w, r)
 		}
-		return next.ServeHTTP(w, r)
+		return true, next.ServeHTTP(w, r)
 	}
 
 	if authErr != nil {
 		if h.ProbeResistance != nil {
-			return next.ServeHTTP(w, r)
+			return true, next.ServeHTTP(w, r)
 		}
 		w.Header().Set(headerProxyAuthenticate, "Basic realm=\"Caddy Secure Web Proxy\"")
-		return caddyhttp.Error(http.StatusProxyAuthRequired, authErr)
+		return true, caddyhttp.Error(http.StatusProxyAuthRequired, authErr)
 	}
-	return nil
+	return false, nil
 }
 
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, ctx context.Context, username string) error {
