@@ -196,13 +196,38 @@ func (s *trafficState) periodicFlush(ctx context.Context) {
 	}
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	var lastErr error
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			snap := s.collectSnapshot()
-			s.writeSnapshot(snap)
+			data, err := json.Marshal(snap)
+			if err != nil {
+				if s.log != nil && (lastErr == nil || err.Error() != lastErr.Error()) {
+					s.log.Warn("traffic marshal error", zap.Error(err))
+					lastErr = err
+				}
+				continue
+			}
+			tmp := s.file + ".tmp"
+			if err := os.WriteFile(tmp, data, 0600); err != nil {
+				if s.log != nil && (lastErr == nil || err.Error() != lastErr.Error()) {
+					s.log.Warn("traffic write error", zap.Error(err))
+					lastErr = err
+				}
+				continue
+			}
+			if err := os.Rename(tmp, s.file); err != nil {
+				if s.log != nil && (lastErr == nil || err.Error() != lastErr.Error()) {
+					s.log.Warn("traffic rename error", zap.Error(err))
+					lastErr = err
+				}
+				os.Remove(tmp)
+				continue
+			}
+			lastErr = nil
 		}
 	}
 }
@@ -222,25 +247,4 @@ func (s *trafficState) collectSnapshot() TrafficSnapshot {
 	}
 }
 
-func (s *trafficState) writeSnapshot(snap TrafficSnapshot) {
-	data, err := json.Marshal(snap)
-	if err != nil {
-		if s.log != nil {
-			s.log.Warn("traffic marshal error", zap.Error(err))
-		}
-		return
-	}
-	tmp := s.file + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		if s.log != nil {
-			s.log.Warn("traffic write error", zap.Error(err))
-		}
-		return
-	}
-	if err := os.Rename(tmp, s.file); err != nil {
-		if s.log != nil {
-			s.log.Warn("traffic rename error", zap.Error(err))
-		}
-		os.Remove(tmp)
-	}
-}
+

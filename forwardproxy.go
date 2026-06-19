@@ -413,30 +413,6 @@ func (h *Handler) handleConnectH1(w http.ResponseWriter, r *http.Request, ctx co
 	}
 	w.Header().Set("Padding", string(padding))
 
-	w.WriteHeader(http.StatusOK)
-	if err := http.NewResponseController(w).Flush(); err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError,
-			fmt.Errorf("ResponseWriter flush error: %v", err))
-	}
-
-	// Hijack immediately after writing 200 OK — before the client
-	// sends further tunnel data, to prevent Go's HTTP server from
-	// consuming the subsequent bytes.
-	clientConn, brw, err := http.NewResponseController(w).Hijack()
-	if err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError,
-			fmt.Errorf("hijack failed: %v", err))
-	}
-	defer clientConn.Close()
-
-	_ = clientConn.SetDeadline(time.Time{})
-
-	if n := brw.Reader.Buffered(); n > 0 {
-		rbuf, _ := brw.Peek(n)
-		_, _ = clientConn.Write(rbuf) // not needed, but harmless
-		_ = rbuf
-	}
-
 	targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
 	if err != nil {
 		return err
@@ -450,6 +426,26 @@ func (h *Handler) handleConnectH1(w http.ResponseWriter, r *http.Request, ctx co
 	if username != "" {
 		incConn(username)
 		defer decConn(username)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("ResponseWriter flush error: %v", err))
+	}
+
+	clientConn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("hijack failed: %v", err))
+	}
+	defer clientConn.Close()
+
+	_ = clientConn.SetDeadline(time.Time{})
+
+	if n := brw.Reader.Buffered(); n > 0 {
+		rbuf, _ := brw.Peek(n)
+		_, _ = targetConn.Write(rbuf)
 	}
 
 	return dualStream(targetConn, clientConn, clientConn, false, username)
