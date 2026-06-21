@@ -2,10 +2,10 @@ package forwardproxy
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -14,16 +14,17 @@ import (
 type geositeReader struct {
 	mu         sync.RWMutex
 	categories map[string]*geositeCategory // category -> domain set
+	intern     map[string]string           // string interning pool
 	loaded     bool
 }
 
 // geositeCategory stores domains for a single category with O(1) exact lookup.
 type geositeCategory struct {
-	exact   map[string]struct{} // exact domain matches (O(1))
-	subdoms []string            // domains to check for subdomain suffix matching
+	exact   map[string]struct{} // exact domain matches (O(1)), keys from intern pool
+	subdoms []string            // domains to check for subdomain suffix matching, from intern pool
 }
 
-// loadGeositeFile loads a V2Ray geosite.dat file.
+// loadGeositeFile loads a V2Ray geosite.dat file via mmap.
 func loadGeositeFile(path string) (*geositeReader, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -31,20 +32,31 @@ func loadGeositeFile(path string) (*geositeReader, error) {
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(f)
+	info, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read geosite.dat: %w", err)
+		return nil, fmt.Errorf("failed to stat geosite.dat: %w", err)
+	}
+	size := info.Size()
+	if size == 0 {
+		return &geositeReader{}, nil
 	}
 
-	return parseGeositeData(data)
+	b, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("failed to mmap geosite.dat: %w", err)
+	}
+	defer syscall.Munmap(b)
+
+	return parseGeositeData(b)
 }
 
 func parseGeositeData(data []byte) (*geositeReader, error) {
 	reader := &geositeReader{
 		categories: make(map[string]*geositeCategory),
+		intern:     make(map[string]string),
 	}
 
-	// Parse top-level Config message: repeated DomainGroup domain = 2;
+	// Parse top-level Config message: repeated GeoSite geosite = 1;
 	buf := data
 	for len(buf) > 0 {
 		num, typ, n := protowire.ConsumeTag(buf)
@@ -53,7 +65,7 @@ func parseGeositeData(data []byte) (*geositeReader, error) {
 		}
 		buf = buf[n:]
 
-		if num != 2 || typ != protowire.BytesType {
+		if num != 1 || typ != protowire.BytesType {
 			// Skip non-domain fields
 			var err error
 			buf, err = skipProtobufField(buf, typ)
@@ -80,6 +92,7 @@ func parseGeositeData(data []byte) (*geositeReader, error) {
 			}
 			for _, d := range domains {
 				d = strings.TrimPrefix(d, ".")
+				d = reader.internString(d)
 				cat.exact[d] = struct{}{}
 				cat.subdoms = append(cat.subdoms, d)
 			}
@@ -89,6 +102,16 @@ func parseGeositeData(data []byte) (*geositeReader, error) {
 
 	reader.loaded = true
 	return reader, nil
+}
+
+// internString returns a canonical copy of s, reusing memory across all
+// domains that share the same content. Caller must not mutate the result.
+func (r *geositeReader) internString(s string) string {
+	if canonical, ok := r.intern[s]; ok {
+		return canonical
+	}
+	r.intern[s] = s
+	return s
 }
 
 func parseGeositeEntry(data []byte) (string, []string, error) {

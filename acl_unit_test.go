@@ -206,25 +206,13 @@ func TestNewACLRuleWithProtoPort(t *testing.T) {
 }
 
 func TestGeoIPRule(t *testing.T) {
-	reader := &geoIPReader{
-		entries: []geoIPNet{
-			{
-				countryCode: "US",
-				ipNet: net.IPNet{
-					IP:   net.ParseIP("1.2.0.0"),
-					Mask: net.CIDRMask(16, 32),
-				},
-			},
-			{
-				countryCode: "CN",
-				ipNet: net.IPNet{
-					IP:   net.ParseIP("5.6.0.0"),
-					Mask: net.CIDRMask(16, 32),
-				},
-			},
-		},
-		loaded: true,
-	}
+	reader := makeTestGeoIPReader([]struct {
+		code  string
+		cidrs []struct{ ip string; prefix int }
+	}{
+		{code: "US", cidrs: []struct{ ip string; prefix int }{{"1.2.0.0", 16}}},
+		{code: "CN", cidrs: []struct{ ip string; prefix int }{{"5.6.0.0", 16}}},
+	})
 
 	// Match US
 	rule := &aclGeoIPRule{country: "US", allow: true, reader: reader}
@@ -302,18 +290,12 @@ func TestPrivateIPRanges(t *testing.T) {
 }
 
 func TestGeoIPReaderLookupCountry(t *testing.T) {
-	reader := &geoIPReader{
-		entries: []geoIPNet{
-			{
-				countryCode: "US",
-				ipNet: net.IPNet{
-					IP:   net.ParseIP("8.8.8.0"),
-					Mask: net.CIDRMask(24, 32),
-				},
-			},
-		},
-		loaded: true,
-	}
+	reader := makeTestGeoIPReader([]struct {
+		code  string
+		cidrs []struct{ ip string; prefix int }
+	}{
+		{code: "US", cidrs: []struct{ ip string; prefix int }{{"8.8.8.0", 24}}},
+	})
 
 	if country := reader.lookupCountry(net.ParseIP("8.8.8.8")); country != "US" {
 		t.Errorf("lookupCountry(8.8.8.8) = %q, want US", country)
@@ -400,18 +382,12 @@ func TestACLDomainRuleSubdomainNotAllowed(t *testing.T) {
 }
 
 func TestGeoIPRuleNilIP(t *testing.T) {
-	reader := &geoIPReader{
-		entries: []geoIPNet{
-			{
-				countryCode: "US",
-				ipNet: net.IPNet{
-					IP:   net.ParseIP("1.2.0.0"),
-					Mask: net.CIDRMask(16, 32),
-				},
-			},
-		},
-		loaded: true,
-	}
+	reader := makeTestGeoIPReader([]struct {
+		code  string
+		cidrs []struct{ ip string; prefix int }
+	}{
+		{code: "US", cidrs: []struct{ ip string; prefix int }{{"1.2.0.0", 16}}},
+	})
 	rule := &aclGeoIPRule{country: "US", allow: true, reader: reader}
 	if rule.tryMatch(nil, "") != aclDecisionNoMatch {
 		t.Error("expected no match for nil IP")
@@ -426,18 +402,12 @@ func TestGeoIPRuleNilReader(t *testing.T) {
 }
 
 func TestGeoIPRuleNegatedUnknownCountry(t *testing.T) {
-	reader := &geoIPReader{
-		entries: []geoIPNet{
-			{
-				countryCode: "US",
-				ipNet: net.IPNet{
-					IP:   net.ParseIP("1.2.0.0"),
-					Mask: net.CIDRMask(16, 32),
-				},
-			},
-		},
-		loaded: true,
-	}
+	reader := makeTestGeoIPReader([]struct {
+		code  string
+		cidrs []struct{ ip string; prefix int }
+	}{
+		{code: "US", cidrs: []struct{ ip string; prefix int }{{"1.2.0.0", 16}}},
+	})
 	// IP with unknown country (not US), negated rule for US → should match
 	rule := &aclGeoIPRule{country: "US", allow: true, reader: reader, negated: true}
 	if rule.tryMatch(net.ParseIP("99.99.99.99"), "") != aclDecisionAllow {
@@ -450,18 +420,12 @@ func TestGeoIPRuleNegatedUnknownCountry(t *testing.T) {
 }
 
 func TestGeoIPRuleNegatedDeny(t *testing.T) {
-	reader := &geoIPReader{
-		entries: []geoIPNet{
-			{
-				countryCode: "RU",
-				ipNet: net.IPNet{
-					IP:   net.ParseIP("5.6.0.0"),
-					Mask: net.CIDRMask(16, 32),
-				},
-			},
-		},
-		loaded: true,
-	}
+	reader := makeTestGeoIPReader([]struct {
+		code  string
+		cidrs []struct{ ip string; prefix int }
+	}{
+		{code: "RU", cidrs: []struct{ ip string; prefix int }{{"5.6.0.0", 16}}},
+	})
 	// Negated deny: deny everything except RU
 	rule := &aclGeoIPRule{country: "RU", allow: false, reader: reader, negated: true}
 	if rule.tryMatch(net.ParseIP("1.2.3.4"), "") != aclDecisionDeny {
@@ -749,18 +713,12 @@ func TestPrivateIPRangesIPv6(t *testing.T) {
 }
 
 func TestGeoIPRuleWithIPNetwork(t *testing.T) {
-	reader := &geoIPReader{
-		entries: []geoIPNet{
-			{
-				countryCode: "DE",
-				ipNet: net.IPNet{
-					IP:   net.ParseIP("185.0.0.0"),
-					Mask: net.CIDRMask(8, 32),
-				},
-			},
-		},
-		loaded: true,
-	}
+	reader := makeTestGeoIPReader([]struct {
+		code  string
+		cidrs []struct{ ip string; prefix int }
+	}{
+		{code: "DE", cidrs: []struct{ ip string; prefix int }{{"185.0.0.0", 8}}},
+	})
 	rule := &aclGeoIPRule{country: "DE", allow: true, reader: reader}
 	if rule.tryMatch(net.ParseIP("185.1.2.3"), "") != aclDecisionAllow {
 		t.Error("expected allow for DE IP in /8 range")
@@ -841,6 +799,35 @@ func encodeVarintField(b []byte, num protowire.Number, v uint64) []byte {
 
 // --- GeoIP protobuf parser tests ---
 
+// makeTestGeoIPReader builds a geoIPReader from synthetic CIDR data for tests.
+func makeTestGeoIPReader(countries []struct {
+	code string
+	cidrs []struct {
+		ip     string
+		prefix int
+	}
+}) *geoIPReader {
+	r := &geoIPReader{loaded: true}
+	for _, c := range countries {
+		co := geoIPCountry{countryCode: c.code}
+		for _, cidr := range c.cidrs {
+			ip := net.ParseIP(cidr.ip)
+			if ip4 := ip.To4(); ip4 != nil {
+				co.v4 = append(co.v4, geoIPCIDRv4{
+					ip:     uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3]),
+					prefix: uint8(cidr.prefix),
+				})
+			} else {
+				var b [16]byte
+				copy(b[:], ip.To16())
+				co.v6 = append(co.v6, geoIPCIDRv6{ip: b, prefix: uint8(cidr.prefix)})
+			}
+		}
+		r.countries = append(r.countries, co)
+	}
+	return r
+}
+
 func TestParseGeoIPDataSingleCountry(t *testing.T) {
 	// Build a synthetic geoip.dat with one country "US" and one CIDR 1.2.3.0/24
 	// GeoIP message: string country_code = 1; repeated CIDR cidr = 2;
@@ -861,17 +848,19 @@ func TestParseGeoIPDataSingleCountry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseGeoIPData failed: %v", err)
 	}
-	if len(reader.entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(reader.entries))
+	if len(reader.countries) != 1 || reader.countCIDRs() != 1 {
+		t.Fatalf("expected 1 country with 1 CIDR, got %d countries with %d CIDRs", len(reader.countries), reader.countCIDRs())
 	}
-	if reader.entries[0].countryCode != "US" {
-		t.Errorf("country = %q, want US", reader.entries[0].countryCode)
+	if reader.countries[0].countryCode != "US" {
+		t.Errorf("country = %q, want US", reader.countries[0].countryCode)
 	}
-	if !reader.entries[0].ipNet.Contains(net.ParseIP("1.2.3.5")) {
-		t.Error("expected 1.2.3.5 to be in US range")
+	cc := reader.lookupCountry(net.ParseIP("1.2.3.5"))
+	if cc != "US" {
+		t.Errorf("expected 1.2.3.5 to be in US range, got %q", cc)
 	}
-	if reader.entries[0].ipNet.Contains(net.ParseIP("1.2.4.1")) {
-		t.Error("expected 1.2.4.1 to NOT be in US range")
+	cc = reader.lookupCountry(net.ParseIP("1.2.4.1"))
+	if cc != "" {
+		t.Errorf("expected 1.2.4.1 to NOT be in US range, got %q", cc)
 	}
 }
 
@@ -899,8 +888,8 @@ func TestParseGeoIPDataMultipleCountries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseGeoIPData failed: %v", err)
 	}
-	if len(reader.entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(reader.entries))
+	if len(reader.countries) != 2 || reader.countCIDRs() != 2 {
+		t.Fatalf("expected 2 countries with 2 CIDRs, got %d countries with %d CIDRs", len(reader.countries), reader.countCIDRs())
 	}
 
 	if country := reader.lookupCountry(net.ParseIP("1.2.3.4")); country != "US" {
@@ -931,8 +920,8 @@ func TestParseGeoIPDataIPv6(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseGeoIPData failed: %v", err)
 	}
-	if len(reader.entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(reader.entries))
+	if len(reader.countries) != 1 || reader.countCIDRs() != 1 {
+		t.Fatalf("expected 1 country with 1 CIDR, got %d countries with %d CIDRs", len(reader.countries), reader.countCIDRs())
 	}
 	if country := reader.lookupCountry(net.ParseIP("2001:db8::1")); country != "RU" {
 		t.Errorf("lookupCountry(2001:db8::1) = %q, want RU", country)
@@ -947,8 +936,8 @@ func TestParseGeoIPDataEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseGeoIPData(nil) failed: %v", err)
 	}
-	if len(reader.entries) != 0 {
-		t.Errorf("expected 0 entries, got %d", len(reader.entries))
+	if len(reader.countries) != 0 {
+		t.Errorf("expected 0 countries, got %d", len(reader.countries))
 	}
 }
 
@@ -966,25 +955,28 @@ func TestParseGeoIPCIDR(t *testing.T) {
 	msg = encodeBytesField(msg, 1, []byte{10, 0, 0, 0})
 	msg = encodeVarintField(msg, 2, 8)
 
-	cidr, err := parseGeoIPCIDR(msg)
+	v4, v6, err := parseGeoIPCIDRCompact(msg)
 	if err != nil {
-		t.Fatalf("parseGeoIPCIDR failed: %v", err)
+		t.Fatalf("parseGeoIPCIDRCompact failed: %v", err)
 	}
-	if len(cidr.ip) != 4 || cidr.ip[0] != 10 {
-		t.Errorf("ip = %v, want [10 0 0 0]", cidr.ip)
+	if len(v4) != 1 || len(v6) != 0 {
+		t.Fatalf("expected 1 v4 CIDR, got v4=%d v6=%d", len(v4), len(v6))
 	}
-	if cidr.prefix != 8 {
-		t.Errorf("prefix = %d, want 8", cidr.prefix)
+	if v4[0].ip != 0x0A000000 { // 10.0.0.0 in big endian
+		t.Errorf("ip = 0x%X, want 0x0A000000", v4[0].ip)
+	}
+	if v4[0].prefix != 8 {
+		t.Errorf("prefix = %d, want 8", v4[0].prefix)
 	}
 }
 
 func TestParseGeoIPCIDREmpty(t *testing.T) {
-	cidr, err := parseGeoIPCIDR(nil)
+	v4, v6, err := parseGeoIPCIDRCompact(nil)
 	if err != nil {
-		t.Fatalf("parseGeoIPCIDR(nil) failed: %v", err)
+		t.Fatalf("parseGeoIPCIDRCompact(nil) failed: %v", err)
 	}
-	if cidr.prefix != 0 {
-		t.Errorf("prefix = %d, want 0", cidr.prefix)
+	if len(v4) != 0 || len(v6) != 0 {
+		t.Errorf("expected empty results, got v4=%d v6=%d", len(v4), len(v6))
 	}
 }
 
@@ -1009,8 +1001,8 @@ func TestParseGeositeDataSingleCategory(t *testing.T) {
 	group = encodeBytesField(group, 2, d1)
 	group = encodeBytesField(group, 2, d2)
 
-	// Top-level: repeated DomainGroup domain = 2;
-	topLevel := encodeBytesField(nil, 2, group)
+	// Top-level: repeated GeoSite geosite = 1;
+	topLevel := encodeBytesField(nil, 1, group)
 
 	reader, err := parseGeositeData(topLevel)
 	if err != nil {
@@ -1048,8 +1040,8 @@ func TestParseGeositeDataMultipleCategories(t *testing.T) {
 	g2 = encodeBytesField(g2, 1, []byte("cn"))
 	g2 = encodeBytesField(g2, 2, d2)
 
-	topLevel := encodeBytesField(nil, 2, g1)
-	topLevel = encodeBytesField(topLevel, 2, g2)
+	topLevel := encodeBytesField(nil, 1, g1)
+	topLevel = encodeBytesField(topLevel, 1, g2)
 
 	reader, err := parseGeositeData(topLevel)
 	if err != nil {
@@ -1088,8 +1080,8 @@ func TestParseGeositeDataDomainTypes(t *testing.T) {
 	g2 = encodeBytesField(g2, 1, []byte("exact"))
 	g2 = encodeBytesField(g2, 2, d3)
 
-	topLevel := encodeBytesField(nil, 2, g)
-	topLevel = encodeBytesField(topLevel, 2, g2)
+	topLevel := encodeBytesField(nil, 1, g)
+	topLevel = encodeBytesField(topLevel, 1, g2)
 
 	reader, err := parseGeositeData(topLevel)
 	if err != nil {
@@ -1132,7 +1124,7 @@ func TestParseGeositeDomainRegex(t *testing.T) {
 	g = encodeBytesField(g, 1, []byte("test"))
 	g = encodeBytesField(g, 2, d)
 
-	topLevel := encodeBytesField(nil, 2, g)
+	topLevel := encodeBytesField(nil, 1, g)
 
 	reader, err := parseGeositeData(topLevel)
 	if err != nil {
@@ -1154,7 +1146,7 @@ func TestParseGeositeEntryLeadingDot(t *testing.T) {
 	g = encodeBytesField(g, 1, []byte("test"))
 	g = encodeBytesField(g, 2, d)
 
-	topLevel := encodeBytesField(nil, 2, g)
+	topLevel := encodeBytesField(nil, 1, g)
 
 	reader, err := parseGeositeData(topLevel)
 	if err != nil {

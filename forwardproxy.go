@@ -207,7 +207,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("failed to load geoip.dat: %w", err)
 		}
 		h.geoIPReader = geoReader
-		h.logger.Info("loaded geoip.dat", zap.Int("entries", len(geoReader.entries)))
+		h.logger.Info("loaded geoip.dat", zap.Int("countries", len(geoReader.countries)), zap.Int("cidrs", geoReader.countCIDRs()))
 	}
 
 	if h.GeositeFile != "" {

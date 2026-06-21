@@ -1,11 +1,12 @@
 package forwardproxy
 
 import (
+	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"sync"
+	"syscall"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -44,16 +45,32 @@ func skipProtobufField(buf []byte, typ protowire.Type) ([]byte, error) {
 // geoIPReader reads V2Ray geoip.dat files and performs country lookups.
 type geoIPReader struct {
 	mu      sync.RWMutex
-	entries []geoIPNet
+	countries []geoIPCountry
 	loaded  bool
 }
 
-type geoIPNet struct {
-	countryCode string
-	ipNet       net.IPNet
+// geoIPCountry groups all CIDRs for a single country code.
+// Country string is stored once per country (not per CIDR).
+type geoIPCountry struct {
+	countryCode string // stored once, shared by all CIDRs
+	v4          []geoIPCIDRv4
+	v6          []geoIPCIDRv6
 }
 
-// loadGeoIPFile loads a V2Ray geoip.dat file.
+// geoIPCIDRv4 is a compact IPv4 CIDR: IP as uint32 + prefix bits.
+// No slices, no net.IPNet — just 8 bytes per entry.
+type geoIPCIDRv4 struct {
+	ip     uint32 // network byte order
+	prefix uint8  // CIDR prefix length (0-32)
+}
+
+// geoIPCIDRv6 is a compact IPv6 CIDR: IP as [16]byte + prefix bits.
+type geoIPCIDRv6 struct {
+	ip     [16]byte
+	prefix uint8
+}
+
+// loadGeoIPFile loads a V2Ray geoip.dat file via mmap.
 func loadGeoIPFile(path string) (*geoIPReader, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -61,18 +78,39 @@ func loadGeoIPFile(path string) (*geoIPReader, error) {
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(f)
+	info, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read geoip.dat: %w", err)
+		return nil, fmt.Errorf("failed to stat geoip.dat: %w", err)
+	}
+	size := info.Size()
+	if size == 0 {
+		return &geoIPReader{}, nil
 	}
 
-	return parseGeoIPData(data)
+	b, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("failed to mmap geoip.dat: %w", err)
+	}
+	defer syscall.Munmap(b)
+
+	return parseGeoIPData(b)
 }
 
+// parseGeoIPData parses the protobuf and groups CIDRs by country.
 func parseGeoIPData(data []byte) (*geoIPReader, error) {
 	reader := &geoIPReader{}
 
-	// Parse top-level Config message: repeated GeoIP geoip = 1;
+	// intern map: deduplicates country code strings
+	intern := make(map[string]string)
+
+	// Temporary: collect all raw entries before grouping
+	type rawEntry struct {
+		countryCode string
+		v4          []geoIPCIDRv4
+		v6          []geoIPCIDRv6
+	}
+	var raw []rawEntry
+
 	buf := data
 	for len(buf) > 0 {
 		num, typ, n := protowire.ConsumeTag(buf)
@@ -82,7 +120,6 @@ func parseGeoIPData(data []byte) (*geoIPReader, error) {
 		buf = buf[n:]
 
 		if num != 1 || typ != protowire.BytesType {
-			// Skip non-geoip fields
 			var err error
 			buf, err = skipProtobufField(buf, typ)
 			if err != nil {
@@ -91,7 +128,6 @@ func parseGeoIPData(data []byte) (*geoIPReader, error) {
 			continue
 		}
 
-		// Consume the GeoIP message bytes
 		msgBytes, n := protowire.ConsumeBytes(buf)
 		if n < 0 {
 			return nil, fmt.Errorf("invalid protobuf bytes in geoip.dat")
@@ -102,16 +138,52 @@ func parseGeoIPData(data []byte) (*geoIPReader, error) {
 		if err != nil {
 			return nil, err
 		}
-		reader.entries = append(reader.entries, entry...)
+		if entry != nil {
+			// Intern country code
+			if canonical, ok := intern[entry.countryCode]; ok {
+				entry.countryCode = canonical
+			} else {
+				intern[entry.countryCode] = entry.countryCode
+			}
+			raw = append(raw, rawEntry{
+				countryCode: entry.countryCode,
+				v4:          entry.v4,
+				v6:          entry.v6,
+			})
+		}
 	}
 
+	// Group by country code
+	grouped := make(map[string]*geoIPCountry, len(intern))
+	for i := range raw {
+		cc := raw[i].countryCode
+		c, ok := grouped[cc]
+		if !ok {
+			c = &geoIPCountry{countryCode: cc}
+			grouped[cc] = c
+		}
+		c.v4 = append(c.v4, raw[i].v4...)
+		c.v6 = append(c.v6, raw[i].v6...)
+	}
+
+	reader.countries = make([]geoIPCountry, 0, len(grouped))
+	for _, c := range grouped {
+		reader.countries = append(reader.countries, *c)
+	}
 	reader.loaded = true
 	return reader, nil
 }
 
-func parseGeoIPEntry(data []byte) ([]geoIPNet, error) {
+type rawGeoIPEntry struct {
+	countryCode string
+	v4          []geoIPCIDRv4
+	v6          []geoIPCIDRv6
+}
+
+func parseGeoIPEntry(data []byte) (*rawGeoIPEntry, error) {
 	var countryCode string
-	var cidrs []geoIPCIDR
+	var v4 []geoIPCIDRv4
+	var v6 []geoIPCIDRv6
 
 	buf := data
 	for len(buf) > 0 {
@@ -123,7 +195,6 @@ func parseGeoIPEntry(data []byte) ([]geoIPNet, error) {
 
 		switch {
 		case num == 1 && typ == protowire.BytesType:
-			// string country_code = 1
 			val, n := protowire.ConsumeBytes(buf)
 			if n < 0 {
 				return nil, fmt.Errorf("invalid country_code in geoip entry")
@@ -132,25 +203,23 @@ func parseGeoIPEntry(data []byte) ([]geoIPNet, error) {
 			buf = buf[n:]
 
 		case num == 2 && typ == protowire.BytesType:
-			// repeated CIDR cidr = 2
 			cidrBytes, n := protowire.ConsumeBytes(buf)
 			if n < 0 {
 				return nil, fmt.Errorf("invalid cidr in geoip entry")
 			}
-			cidr, err := parseGeoIPCIDR(cidrBytes)
+			v4c, v6c, err := parseGeoIPCIDRCompact(cidrBytes)
 			if err != nil {
 				return nil, err
 			}
-			cidrs = append(cidrs, *cidr)
+			v4 = append(v4, v4c...)
+			v6 = append(v6, v6c...)
 			buf = buf[n:]
 
 		case num == 3 && typ == protowire.VarintType:
-			// bool reverse_match = 3
 			_, n := protowire.ConsumeVarint(buf)
 			buf = buf[n:]
 
 		default:
-			// Skip unknown fields
 			var err error
 			buf, err = skipProtobufField(buf, typ)
 			if err != nil {
@@ -159,42 +228,22 @@ func parseGeoIPEntry(data []byte) ([]geoIPNet, error) {
 		}
 	}
 
-	var results []geoIPNet
-	for _, cidr := range cidrs {
-		var ipNet net.IPNet
-		if len(cidr.ip) == 4 {
-			ipNet = net.IPNet{
-				IP:   cidr.ip,
-				Mask: net.CIDRMask(int(cidr.prefix), 32),
-			}
-		} else if len(cidr.ip) == 16 {
-			ipNet = net.IPNet{
-				IP:   cidr.ip,
-				Mask: net.CIDRMask(int(cidr.prefix), 128),
-			}
-		} else {
-			continue
-		}
-		results = append(results, geoIPNet{
-			countryCode: countryCode,
-			ipNet:       ipNet,
-		})
+	if countryCode == "" || (len(v4) == 0 && len(v6) == 0) {
+		return nil, nil
 	}
-	return results, nil
+	return &rawGeoIPEntry{countryCode: countryCode, v4: v4, v6: v6}, nil
 }
 
-type geoIPCIDR struct {
-	ip     []byte
-	prefix int32
-}
+// parseGeoIPCIDRCompact parses a CIDR protobuf message into compact form.
+func parseGeoIPCIDRCompact(data []byte) ([]geoIPCIDRv4, []geoIPCIDRv6, error) {
+	var ip []byte
+	var prefix int32
 
-func parseGeoIPCIDR(data []byte) (*geoIPCIDR, error) {
-	cidr := &geoIPCIDR{}
 	buf := data
 	for len(buf) > 0 {
 		num, typ, n := protowire.ConsumeTag(buf)
 		if n < 0 {
-			return nil, fmt.Errorf("invalid protobuf tag in CIDR")
+			return nil, nil, fmt.Errorf("invalid protobuf tag in CIDR")
 		}
 		buf = buf[n:]
 
@@ -202,29 +251,43 @@ func parseGeoIPCIDR(data []byte) (*geoIPCIDR, error) {
 		case num == 1 && typ == protowire.BytesType:
 			ipBytes, n := protowire.ConsumeBytes(buf)
 			if n < 0 {
-				return nil, fmt.Errorf("invalid ip in CIDR")
+				return nil, nil, fmt.Errorf("invalid ip in CIDR")
 			}
-			cidr.ip = make([]byte, len(ipBytes))
-			copy(cidr.ip, ipBytes)
+			ip = ipBytes
 			buf = buf[n:]
 
 		case num == 2 && typ == protowire.VarintType:
 			val, n := protowire.ConsumeVarint(buf)
 			if n < 0 {
-				return nil, fmt.Errorf("invalid prefix in CIDR")
+				return nil, nil, fmt.Errorf("invalid prefix in CIDR")
 			}
-			cidr.prefix = int32(val)
+			prefix = int32(val)
 			buf = buf[n:]
 
 		default:
 			var err error
 			buf, err = skipProtobufField(buf, typ)
 			if err != nil {
-				return nil, fmt.Errorf("unsupported field in CIDR: %w", err)
+				return nil, nil, fmt.Errorf("unsupported field in CIDR: %w", err)
 			}
 		}
 	}
-	return cidr, nil
+
+	if len(ip) == 4 {
+		return []geoIPCIDRv4{{
+			ip:     binary.BigEndian.Uint32(ip),
+			prefix: uint8(prefix),
+		}}, nil, nil
+	}
+	if len(ip) == 16 {
+		var b [16]byte
+		copy(b[:], ip)
+		return nil, []geoIPCIDRv6{{
+			ip:     b,
+			prefix: uint8(prefix),
+		}}, nil
+	}
+	return nil, nil, nil
 }
 
 // lookupCountry returns the country code for the given IP, or "" if not found.
@@ -232,15 +295,82 @@ func (r *geoIPReader) lookupCountry(ip net.IP) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	for _, entry := range r.entries {
-		if entry.ipNet.Contains(ip) {
-			return entry.countryCode
+	ip4 := ip.To4()
+	if ip4 != nil {
+		return r.lookupCountryV4(binary.BigEndian.Uint32(ip4))
+	}
+	return r.lookupCountryV6(ip)
+}
+
+func (r *geoIPReader) lookupCountryV4(ip uint32) string {
+	for i := range r.countries {
+		c := &r.countries[i]
+		for j := range c.v4 {
+			if cidrMatchV4(ip, &c.v4[j]) {
+				return c.countryCode
+			}
 		}
 	}
 	return ""
 }
 
+func (r *geoIPReader) lookupCountryV6(ip net.IP) string {
+	if len(ip) != 16 {
+		return ""
+	}
+	var ipArr [16]byte
+	copy(ipArr[:], ip)
+
+	for i := range r.countries {
+		c := &r.countries[i]
+		for j := range c.v6 {
+			if cidrMatchV6(ipArr, &c.v6[j]) {
+				return c.countryCode
+			}
+		}
+	}
+	return ""
+}
+
+// cidrMatchV4 checks if ip is in the CIDR range. No allocations.
+func cidrMatchV4(ip uint32, c *geoIPCIDRv4) bool {
+	if c.prefix == 0 {
+		return true
+	}
+	mask := uint32(0xFFFFFFFF) << (32 - c.prefix)
+	return ip&mask == c.ip&mask
+}
+
+// cidrMatchV6 checks if ip is in the CIDR range. No allocations.
+func cidrMatchV6(ip [16]byte, c *geoIPCIDRv6) bool {
+	if c.prefix == 0 {
+		return true
+	}
+	bits := c.prefix
+	for i := 0; i < 16 && bits > 0; i++ {
+		b := uint8(bits)
+		if b > 8 {
+			b = 8
+		}
+		mask := uint8(0xFF) << (8 - b)
+		if ip[i]&mask != c.ip[i]&mask {
+			return false
+		}
+		bits -= b
+	}
+	return true
+}
+
 // hasCountry returns true if the given IP belongs to the specified country.
 func (r *geoIPReader) hasCountry(ip net.IP, country string) bool {
 	return r.lookupCountry(ip) == country
+}
+
+// countCIDRs returns the total number of CIDR entries across all countries.
+func (r *geoIPReader) countCIDRs() int {
+	n := 0
+	for i := range r.countries {
+		n += len(r.countries[i].v4) + len(r.countries[i].v6)
+	}
+	return n
 }
