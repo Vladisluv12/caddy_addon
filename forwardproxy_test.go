@@ -370,7 +370,7 @@ func TestHostIsAllowed(t *testing.T) {
 		h := buildHandler([]ACLRule{
 			{Subjects: []string{"github.com"}, Allow: true},
 		})
-		allowed := h.hostIsAllowed("github.com", net.ParseIP("140.82.121.3"))
+		allowed := h.hostIsAllowed("github.com", net.ParseIP("140.82.121.3"), "tcp", 443, nil)
 		if !allowed {
 			t.Error("github.com should be allowed")
 		}
@@ -378,7 +378,7 @@ func TestHostIsAllowed(t *testing.T) {
 
 	t.Run("denies private IP", func(t *testing.T) {
 		h := buildHandler(nil)
-		allowed := h.hostIsAllowed("local", net.ParseIP("192.168.1.1"))
+		allowed := h.hostIsAllowed("local", net.ParseIP("192.168.1.1"), "tcp", 80, nil)
 		if allowed {
 			t.Error("192.168.1.1 should be denied")
 		}
@@ -386,7 +386,7 @@ func TestHostIsAllowed(t *testing.T) {
 
 	t.Run("default deny all", func(t *testing.T) {
 		h := buildHandler(nil)
-		allowed := h.hostIsAllowed("unknown.com", net.ParseIP("8.8.8.8"))
+		allowed := h.hostIsAllowed("unknown.com", net.ParseIP("8.8.8.8"), "tcp", 443, nil)
 		if allowed {
 			t.Error("should default deny when no allow rule matches")
 		}

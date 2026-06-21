@@ -118,8 +118,15 @@ func (h *Handler) unmarshalACL(d *caddyfile.Dispenser) error {
 		aclAllow := false
 		switch aclDirective {
 		case "allow":
-			ruleSubjects = args
-			aclAllow = true
+			for _, subj := range args {
+				cleanSubj, proto, port, parseErr := parseProtoPort(subj)
+				if parseErr != nil {
+					return d.Errf("invalid allow subject %q: %v", subj, parseErr)
+				}
+				ar := ACLRule{Subjects: []string{cleanSubj}, Allow: true, Proto: proto, Port: port}
+				h.ACL = append(h.ACL, ar)
+			}
+			continue
 		case "allow_file":
 			if len(args) != 1 {
 				return d.Err("allowfile accepts a single filename argument")
@@ -130,7 +137,15 @@ func (h *Handler) unmarshalACL(d *caddyfile.Dispenser) error {
 			}
 			aclAllow = true
 		case "deny":
-			ruleSubjects = args
+			for _, subj := range args {
+				cleanSubj, proto, port, parseErr := parseProtoPort(subj)
+				if parseErr != nil {
+					return d.Errf("invalid deny subject %q: %v", subj, parseErr)
+				}
+				ar := ACLRule{Subjects: []string{cleanSubj}, Allow: false, Proto: proto, Port: port}
+				h.ACL = append(h.ACL, ar)
+			}
+			continue
 		case "deny_file":
 			if len(args) != 1 {
 				return d.Err("denyfile accepts a single filename argument")
@@ -139,8 +154,74 @@ func (h *Handler) unmarshalACL(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return err
 			}
+		case "geoip":
+			if len(args) < 2 {
+				return d.Err("geoip requires at least two arguments: country_code allow/deny")
+			}
+			country := args[0]
+			allowStr := args[1]
+			switch allowStr {
+			case "allow":
+				aclAllow = true
+			case "deny":
+				aclAllow = false
+			default:
+				return d.Errf("geoip second argument must be 'allow' or 'deny', got: %s", allowStr)
+			}
+			ar := ACLRule{GeoIP: country, Allow: aclAllow}
+			h.ACL = append(h.ACL, ar)
+			continue
+		case "geosite":
+			if len(args) < 2 {
+				return d.Err("geosite requires at least two arguments: category allow/deny")
+			}
+			category := args[0]
+			allowStr := args[1]
+			switch allowStr {
+			case "allow":
+				aclAllow = true
+			case "deny":
+				aclAllow = false
+			default:
+				return d.Errf("geosite second argument must be 'allow' or 'deny', got: %s", allowStr)
+			}
+			ar := ACLRule{Geosite: category, Allow: aclAllow}
+			h.ACL = append(h.ACL, ar)
+			continue
+		case "bypass_private":
+			if len(args) != 0 {
+				return d.Err("bypass_private takes no arguments")
+			}
+			trueVal := true
+			h.BypassPrivateIPs = &trueVal
+			continue
+		case "private":
+			if len(args) < 1 {
+				return d.Err("private requires a subcommand: deny or allow")
+			}
+			switch args[0] {
+			case "deny":
+				falseVal := false
+				h.BypassPrivateIPs = &falseVal
+				// Add explicit deny rules for private IP ranges
+				for _, ipRange := range privateIPRanges {
+					ar := ACLRule{Subjects: []string{ipRange}, Allow: false}
+					h.ACL = append(h.ACL, ar)
+				}
+			case "allow":
+				falseVal := false
+				h.BypassPrivateIPs = &falseVal
+				// Add explicit allow rules for private IP ranges
+				for _, ipRange := range privateIPRanges {
+					ar := ACLRule{Subjects: []string{ipRange}, Allow: true}
+					h.ACL = append(h.ACL, ar)
+				}
+			default:
+				return d.Errf("private requires 'deny' or 'allow', got: %s", args[0])
+			}
+			continue
 		default:
-			return d.Err("expected acl directive: allow/allowfile/deny/denyfile." +
+			return d.Err("expected acl directive: allow/allowfile/deny/denyfile/geoip/geosite/bypass_private/private." +
 				"got: " + aclDirective)
 		}
 		ar := ACLRule{Subjects: ruleSubjects, Allow: aclAllow}
@@ -281,6 +362,20 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err := h.unmarshalACL(d); err != nil {
 				return err
 			}
+
+		case "geoip_dat":
+			args := d.RemainingArgs()
+			if len(args) != 1 {
+				return d.Err("geoip_dat requires a single filename argument")
+			}
+			h.GeoIPFile = args[0]
+
+		case "geosite_dat":
+			args := d.RemainingArgs()
+			if len(args) != 1 {
+				return d.Err("geosite_dat requires a single filename argument")
+			}
+			h.GeositeFile = args[0]
 
 		default:
 			return d.ArgErr()

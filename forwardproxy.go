@@ -101,11 +101,21 @@ type Handler struct {
 	// Access control list.
 	ACL []ACLRule `json:"acl,omitempty"`
 
+	// If true (default), private IPs are denied but bypassed via a hardcoded list.
+	// When false, private IPs are handled by explicit ACL rules (deny or allow).
+	BypassPrivateIPs *bool `json:"bypass_private_ips,omitempty"`
+
 	// Ports to be allowed to connect to (if non-empty).
 	AllowedPorts []int `json:"allowed_ports,omitempty"`
 
 	// Path to per-user traffic stats file. Default: /etc/rixxx-panel/naive_users.json
 	TrafficFile string `json:"traffic_file,omitempty"`
+
+	// Path to V2Ray geoip.dat file for country-based IP matching.
+	GeoIPFile string `json:"geoip_file,omitempty"`
+
+	// Path to V2Ray geosite.dat file for domain category matching.
+	GeositeFile string `json:"geosite_file,omitempty"`
 
 	httpTransport *http.Transport
 
@@ -114,6 +124,12 @@ type Handler struct {
 	upstream    *url.URL // address of upstream proxy
 
 	aclRules []aclMatcher
+
+	// geoIPReader is loaded during Provision if GeoIPFile is set.
+	geoIPReader *geoIPReader
+
+	// geositeReader is loaded during Provision if GeositeFile is set.
+	geositeReader *geositeReader
 
 	// AuthCredentials stores base64-encoded "username:password" pairs for Basic auth.
 	// Note: Caddy v2 has built-in authentication modules (http.authentication.providers.http_basic)
@@ -185,6 +201,24 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 
+	if h.GeoIPFile != "" {
+		geoReader, err := loadGeoIPFile(h.GeoIPFile)
+		if err != nil {
+			return fmt.Errorf("failed to load geoip.dat: %w", err)
+		}
+		h.geoIPReader = geoReader
+		h.logger.Info("loaded geoip.dat", zap.Int("entries", len(geoReader.entries)))
+	}
+
+	if h.GeositeFile != "" {
+		siteReader, err := loadGeositeFile(h.GeositeFile)
+		if err != nil {
+			return fmt.Errorf("failed to load geosite.dat: %w", err)
+		}
+		h.geositeReader = siteReader
+		h.logger.Info("loaded geosite.dat", zap.Int("categories", len(siteReader.categories)))
+	}
+
 	if err := h.initACLRules(); err != nil {
 		return err
 	}
@@ -213,29 +247,90 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+var privateIPRanges = []string{
+	"10.0.0.0/8",
+	"100.64.0.0/10",
+	"127.0.0.0/8",
+	"169.254.0.0/16",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"::1/128",
+	"fc00::/7",
+	"fe80::/10",
+}
+
 func (h *Handler) initACLRules() error {
+	hasGeoIPRule := false
+	hasGeositeRule := false
+
 	for _, rule := range h.ACL {
+		// Handle GeoIP rules
+		if rule.GeoIP != "" {
+			if !hasGeoIPRule {
+				hasGeoIPRule = true
+				if h.geoIPReader == nil {
+					h.logger.Warn("geoip ACL rules configured but geoip_dat not loaded — geoip rules will be ignored")
+				}
+			}
+			country := rule.GeoIP
+			negated := false
+			if strings.HasPrefix(country, "!") {
+				negated = true
+				country = country[1:]
+			}
+			h.aclRules = append(h.aclRules, &aclGeoIPRule{
+				country: country,
+				allow:   rule.Allow,
+				reader:  h.geoIPReader,
+				negated: negated,
+			})
+			continue
+		}
+		// Handle Geosite rules
+		if rule.Geosite != "" {
+			if !hasGeositeRule {
+				hasGeositeRule = true
+				if h.geositeReader == nil {
+					h.logger.Warn("geosite ACL rules configured but geosite_dat not loaded — geosite rules will be ignored")
+				}
+			}
+			category := rule.Geosite
+			negated := false
+			if strings.HasPrefix(category, "!") {
+				negated = true
+				category = category[1:]
+			}
+			h.aclRules = append(h.aclRules, &aclGeositeRule{
+				category: category,
+				allow:    rule.Allow,
+				reader:   h.geositeReader,
+				negated:  negated,
+			})
+			continue
+		}
+		// Handle standard IP/domain rules
 		for _, subj := range rule.Subjects {
-			ar, err := newACLRule(subj, rule.Allow)
+			ar, err := newACLRuleWithProtoPort(subj, rule.Allow, rule.Proto, rule.Port)
 			if err != nil {
 				return err
 			}
 			h.aclRules = append(h.aclRules, ar)
 		}
 	}
-	for _, ipDeny := range []string{
-		"10.0.0.0/8",
-		"127.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"::1/128",
-		"fe80::/10",
-	} {
-		ar, err := newACLRule(ipDeny, false)
-		if err != nil {
-			return err
+
+	bypassPrivate := true
+	if h.BypassPrivateIPs != nil {
+		bypassPrivate = *h.BypassPrivateIPs
+	}
+
+	if bypassPrivate {
+		for _, ipDeny := range privateIPRanges {
+			ar, err := newACLRule(ipDeny, false)
+			if err != nil {
+				return err
+			}
+			h.aclRules = append(h.aclRules, ar)
 		}
-		h.aclRules = append(h.aclRules, ar)
 	}
 	return nil
 }
@@ -464,12 +559,6 @@ func (h *Handler) handleConnectH2H3(w http.ResponseWriter, r *http.Request, ctx 
 	}
 	w.Header().Set("Padding", string(padding))
 
-	w.WriteHeader(http.StatusOK)
-	if err := http.NewResponseController(w).Flush(); err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError,
-			fmt.Errorf("ResponseWriter flush error: %v", err))
-	}
-
 	targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
 	if err != nil {
 		return err
@@ -483,6 +572,12 @@ func (h *Handler) handleConnectH2H3(w http.ResponseWriter, r *http.Request, ctx 
 	if username != "" {
 		incConn(username)
 		defer decConn(username)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("ResponseWriter flush error: %v", err))
 	}
 
 	defer r.Body.Close()
@@ -686,6 +781,16 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		return nil, caddyhttp.Error(http.StatusBadRequest, err)
 	}
 
+	// Extract proto from network (tcp -> "tcp")
+	proto := "tcp"
+	if network == "tcp4" {
+		proto = "tcp"
+	} else if network == "tcp6" {
+		proto = "tcp"
+	}
+
+	portInt, portErr := strconv.Atoi(port)
+
 	if h.upstream != nil {
 		conn, err := h.dialContext(ctx, network, hostPort)
 		if err != nil {
@@ -699,28 +804,37 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 			fmt.Errorf("port %s is not allowed", port))
 	}
 
-	if !h.domainIsAllowed(host) {
+	if !h.domainIsAllowed(host, proto, portInt, portErr) {
 		return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("disallowed host %s", host))
 	}
 
-	return h.dialAllowedIP(ctx, network, host, port)
+	return h.dialAllowedIP(ctx, network, host, port, proto, portInt, portErr)
 }
 
-func (h Handler) domainIsAllowed(host string) bool {
+func (h Handler) domainIsAllowed(host string, proto string, portInt int, portErr error) bool {
 	for _, rule := range h.aclRules {
 		if _, ok := rule.(*aclDomainRule); ok {
-			switch rule.tryMatch(nil, host) {
-			case aclDecisionDeny:
-				return false
-			case aclDecisionAllow:
-				return true
+			if portErr == nil {
+				switch rule.tryMatchFull(nil, host, proto, portInt) {
+				case aclDecisionDeny:
+					return false
+				case aclDecisionAllow:
+					return true
+				}
+			} else {
+				switch rule.tryMatch(nil, host) {
+				case aclDecisionDeny:
+					return false
+				case aclDecisionAllow:
+					return true
+				}
 			}
 		}
 	}
 	return true // not denied by domain rules, let IP rules decide
 }
 
-func (h Handler) dialAllowedIP(ctx context.Context, network, host, port string) (net.Conn, error) {
+func (h Handler) dialAllowedIP(ctx context.Context, network, host, port, proto string, portInt int, portErr error) (net.Conn, error) {
 	IPs, err := net.LookupIP(host)
 	if err != nil {
 		return nil, caddyhttp.Error(http.StatusBadGateway,
@@ -728,7 +842,7 @@ func (h Handler) dialAllowedIP(ctx context.Context, network, host, port string) 
 	}
 
 	for _, ip := range IPs {
-		if !h.hostIsAllowed(host, ip) {
+		if !h.hostIsAllowed(host, ip, proto, portInt, portErr) {
 			continue
 		}
 		conn, err := h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
@@ -740,16 +854,25 @@ func (h Handler) dialAllowedIP(ctx context.Context, network, host, port string) 
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
 }
 
-func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
+func (h Handler) hostIsAllowed(hostname string, ip net.IP, proto string, portInt int, portErr error) bool {
 	for _, rule := range h.aclRules {
-		switch rule.tryMatch(ip, hostname) {
-		case aclDecisionDeny:
-			return false
-		case aclDecisionAllow:
-			return true
+		if portErr == nil {
+			switch rule.tryMatchFull(ip, hostname, proto, portInt) {
+			case aclDecisionDeny:
+				return false
+			case aclDecisionAllow:
+				return true
+			}
+		} else {
+			switch rule.tryMatch(ip, hostname) {
+			case aclDecisionDeny:
+				return false
+			case aclDecisionAllow:
+				return true
+			}
 		}
 	}
-		h.logger.Warn("no acl match", zap.String("hostname", hostname), zap.Stringer("ip", ip))
+	h.logger.Warn("no acl match", zap.String("hostname", hostname), zap.Stringer("ip", ip))
 	return false
 }
 
